@@ -1,50 +1,33 @@
 import gradio as gr
 import pandas as pd
+import os
 import backend_logic as bl
 
-def process_file(file):
+def process_and_attribute(order_file, call_file):
     try:
-        # Load the formatted CSV
-        raw_df = pd.read_csv(file.name)
+        o_df = pd.read_csv(order_file.name)
+        c_df = pd.read_csv(call_file.name)
         
-        # Run logic
-        result_df = bl.run_attribution(raw_df)
+        result = bl.run_attribution_process(o_df, c_df)
         
-        # Select and order columns for the final report
-        # Ensuring both Window A and Window B are shown for talk time reporting
-        report_cols = [
-            'Name', 'Total', 'Created at', 'Phone', 'Agent Name', 
-            'Window A Time', 'Window B Time', 'Attributed Revenue'
-        ]
-        
-        # Only keep columns that exist in the result
-        final_report = result_df[[c for c in report_cols if c in result_df.columns]]
-        
-        return final_report, "Attribution Complete."
+        # Clean up output columns for the manager's view
+        display_cols = ['Order ID', 'Order Value', 'Order Time', 'Order Phone', 'Agent', 'Window A Time', 'Window B Time', 'Attributed Revenue']
+        return result[display_cols], "✅ Attribution successful. Transpose complete."
     except Exception as e:
         return None, f"❌ Error: {str(e)}"
 
-# UI Layout
-with gr.Blocks(title="TSC Revenue Attribution") as demo:
-    gr.Markdown("Revenue Attribution Portal")
-    gr.Markdown("Upload your formatted CSV to process duplication and proportionate splits.")
-    
+with gr.Blocks(title="TSC Revenue Hub") as demo:
+    gr.Markdown("# 🚀 TSC Revenue Attribution Engine")
     with gr.Row():
-        file_input = gr.File(label="Upload Formatted CSV")
+        ord_in = gr.File(label="Upload Orders CSV")
+        call_in = gr.File(label="Upload Calls CSV")
     
-    run_btn = gr.Button("Calculate Attribution", variant="primary")
-    
+    btn = gr.Button("Run Transpose & Attribute", variant="primary")
     status = gr.Markdown()
-    output_table = gr.Dataframe(label="Attributed Orders List")
+    table = gr.Dataframe()
 
-    run_btn.click(
-        fn=process_file,
-        inputs=file_input,
-        outputs=[output_table, status]
-    )
-    import os
+    btn.click(process_and_attribute, inputs=[ord_in, call_input], outputs=[table, status])
 
 if __name__ == "__main__":
-    # This tells Gradio to use the port Render provides
     port = int(os.environ.get("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port)
