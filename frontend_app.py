@@ -20,13 +20,13 @@ def process_file(file):
         # Only keep columns that exist in the result
         final_report = result_df[[c for c in report_cols if c in result_df.columns]]
         
-        return final_report, "✅ Attribution Complete."
+        return final_report, "Attribution Complete."
     except Exception as e:
         return None, f"❌ Error: {str(e)}"
 
 # UI Layout
 with gr.Blocks(title="TSC Revenue Attribution") as demo:
-    gr.Markdown("# 💰 Revenue Attribution Portal")
+    gr.Markdown("Revenue Attribution Portal")
     gr.Markdown("Upload your formatted CSV to process duplication and proportionate splits.")
     
     with gr.Row():
@@ -42,6 +42,9 @@ with gr.Blocks(title="TSC Revenue Attribution") as demo:
         inputs=file_input,
         outputs=[output_table, status]
     )
+    import os
 
 if __name__ == "__main__":
-    demo.launch()
+    # This tells Gradio to use the port Render provides
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
