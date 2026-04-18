@@ -1,5 +1,4 @@
 import pandas as pd
-import os
 
 def hms_to_sec(t):
     if pd.isna(t) or t == 0: return 0
@@ -15,61 +14,77 @@ def sec_to_hms(s):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def run_attribution_process(orders_df, calls_df):
-    # 1. Standardize Data
+    # 1. Pre-process and Standardize
     orders_df['Order Time'] = pd.to_datetime(orders_df['Order Time'])
     calls_df['Call Time'] = pd.to_datetime(calls_df['Call Time'])
     calls_df['Secs'] = calls_df['User Talk Time'].apply(hms_to_sec)
-    
-    # 2. Define Windows
     feb_start = pd.Timestamp('2026-02-01')
     
+    # Clean phone numbers to ensure a perfect match
+    orders_df['JoinPhone'] = orders_df['Order Phone'].astype(str).str.strip()
+    calls_df['JoinPhone'] = calls_df['Phone Number'].astype(str).str.strip()
+
+    # 2. VECTORIZED MERGE: Match calls to orders by phone number
+    # We only keep calls from phone numbers that actually placed an order
+    merged = pd.merge(
+        orders_df, 
+        calls_df[['JoinPhone', 'Call Time', 'User ID', 'Secs']], 
+        on='JoinPhone', 
+        how='left'
+    )
+
+    # 3. BULK FILTER: Keep only calls that happened before the order
+    # This replaces the loop entirely
+    merged = merged[merged['Call Time'] < merged['Order Time']].copy()
+    
+    # 4. AGGREGATE: Calculate Window A and Window B in one go
+    # Window A is total Secs. Window B is Secs where Call Time >= Feb 1st
+    merged['WinB_Secs'] = merged.apply(lambda x: x['Secs'] if x['Call Time'] >= feb_start else 0, axis=1)
+    
+    grouped = merged.groupby(['Order ID', 'User ID']).agg({
+        'Secs': 'sum',
+        'WinB_Secs': 'sum'
+    }).reset_index()
+    
+    # 5. FINAL ATTRIBUTION LOGIC
     final_rows = []
-    for _, order in orders_df.iterrows():
-        o_id = order['Order ID']
-        o_val = order['Order Value']
-        o_phone = str(order['Order Phone']).strip()
-        o_time = order['Order Time']
+    # Loop only through orders now (much faster since the math is done)
+    for o_id, o_group in orders_df.groupby('Order ID'):
+        o_val = o_group['Order Value'].iloc[0]
+        o_dict = o_group.iloc[0].to_dict()
         
-        # Filter calls for this customer before order time
-        matches = calls_df[(calls_df['Phone Number'].astype(str).str.contains(o_phone)) & 
-                           (calls_df['Call Time'] < o_time)]
+        # Get pre-calculated agent stats for this order
+        agent_stats = grouped[grouped['Order ID'] == o_id].copy()
         
-        if matches.empty:
-            final_rows.append({**order.to_dict(), 'Agent': 'Organic', 'Window A Time': '00:00:00', 'Window B Time': '00:00:00', 'Attributed Revenue': o_val})
+        if agent_stats.empty:
+            o_dict.update({'Agent': 'Organic', 'Window A Time': '00:00:00', 'Window B Time': '00:00:00', 'Attributed Revenue': o_val})
+            final_rows.append(o_dict)
             continue
 
-        # Aggregate by Agent
-        agent_data = []
-        for agent, group in matches.groupby('User ID'):
-            win_a_secs = group['Secs'].sum()
-            win_b_secs = group[group['Call Time'] >= feb_start]['Secs'].sum()
-            if win_a_secs >= 1: # Only consider agents with >= 1s connection
-                agent_data.append({'Agent': agent, 'WinA': win_a_secs, 'WinB': win_b_secs})
-        
-        if not agent_data:
-            final_rows.append({**order.to_dict(), 'Agent': 'Organic', 'Window A Time': '00:00:00', 'Window B Time': '00:00:00', 'Attributed Revenue': o_val})
-            continue
-
-        # 3. Apply Rules
-        df_agents = pd.DataFrame(agent_data)
-        
+        # Rule Selection
         if o_val < 100000:
-            qual = df_agents[df_agents['WinA'] >= 60]
+            qual = agent_stats[agent_stats['Secs'] >= 60]
             if qual.empty:
-                top = df_agents.sort_values('WinA', ascending=False).iloc[0]
-                final_rows.append({**order.to_dict(), 'Agent': top['Agent'], 'Window A Time': sec_to_hms(top['WinA']), 'Window B Time': sec_to_hms(top['WinB']), 'Attributed Revenue': o_val})
+                top = agent_stats.sort_values('Secs', ascending=False).iloc[0]
+                o_dict.update({'Agent': top['User ID'], 'Window A Time': sec_to_hms(top['Secs']), 'Window B Time': sec_to_hms(top['WinB_Secs']), 'Attributed Revenue': o_val})
+                final_rows.append(o_dict)
             else:
                 for _, ag in qual.iterrows():
-                    final_rows.append({**order.to_dict(), 'Agent': ag['Agent'], 'Window A Time': sec_to_hms(ag['WinA']), 'Window B Time': sec_to_hms(ag['WinB']), 'Attributed Revenue': o_val})
+                    res = o_dict.copy()
+                    res.update({'Agent': ag['User ID'], 'Window A Time': sec_to_hms(ag['Secs']), 'Window B Time': sec_to_hms(ag['WinB_Secs']), 'Attributed Revenue': o_val})
+                    final_rows.append(res)
         else:
-            qual = df_agents[df_agents['WinA'] >= 180]
+            qual = agent_stats[agent_stats['Secs'] >= 180]
             if qual.empty:
-                top = df_agents.sort_values('WinA', ascending=False).iloc[0]
-                final_rows.append({**order.to_dict(), 'Agent': top['Agent'], 'Window A Time': sec_to_hms(top['WinA']), 'Window B Time': sec_to_hms(top['WinB']), 'Attributed Revenue': o_val})
+                top = agent_stats.sort_values('Secs', ascending=False).iloc[0]
+                o_dict.update({'Agent': top['User ID'], 'Window A Time': sec_to_hms(top['Secs']), 'Window B Time': sec_to_hms(top['WinB_Secs']), 'Attributed Revenue': o_val})
+                final_rows.append(o_dict)
             else:
-                total_win_a = qual['WinA'].sum()
+                total_a = qual['Secs'].sum()
                 for _, ag in qual.iterrows():
-                    share = ag['WinA'] / total_win_a
-                    final_rows.append({**order.to_dict(), 'Agent': ag['Agent'], 'Window A Time': sec_to_hms(ag['WinA']), 'Window B Time': sec_to_hms(ag['WinB']), 'Attributed Revenue': round(o_val * share, 2)})
+                    res = o_dict.copy()
+                    share = ag['Secs'] / total_a
+                    res.update({'Agent': ag['User ID'], 'Window A Time': sec_to_hms(ag['Secs']), 'Window B Time': sec_to_hms(ag['WinB_Secs']), 'Attributed Revenue': round(o_val * share, 2)})
+                    final_rows.append(res)
 
     return pd.DataFrame(final_rows)
