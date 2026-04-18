@@ -1,68 +1,75 @@
 import pandas as pd
+import os
 
-def to_sec(t):
-    """Converts HH:MM:SS or MM:SS to total seconds."""
+def hms_to_sec(t):
     if pd.isna(t) or t == 0: return 0
     try:
         parts = str(t).strip().split(':')
         if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
         if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
-        return int(parts[0])
+        return int(float(parts[0]))
     except: return 0
 
-def run_attribution(df):
-    # Ensure date/numeric types
-    df['Total'] = pd.to_numeric(df['Total'], errors='coerce')
-    df['WindowA_Sec'] = df['Window A Time'].apply(to_sec)
-    
-    # We group by the Order ID (Name) to process each order's set of agents
-    order_groups = df.groupby('Name')
-    final_results = []
+def sec_to_hms(s):
+    h = int(s // 3600); m = int((s % 3600) // 60); s = int(s % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-    for name, group in order_groups:
-        order_val = group['Total'].iloc[0]
+def run_attribution_process(orders_df, calls_df):
+    # 1. Standardize Data
+    orders_df['Order Time'] = pd.to_datetime(orders_df['Order Time'])
+    calls_df['Call Time'] = pd.to_datetime(calls_df['Call Time'])
+    calls_df['Secs'] = calls_df['User Talk Time'].apply(hms_to_sec)
+    
+    # 2. Define Windows
+    feb_start = pd.Timestamp('2026-02-01')
+    
+    final_rows = []
+    for _, order in orders_df.iterrows():
+        o_id = order['Order ID']
+        o_val = order['Order Value']
+        o_phone = str(order['Order Phone']).strip()
+        o_time = order['Order Time']
         
-        # Identify Agent Set (Connected with lead >= 1 second in Window A)
-        agent_set = group[group['WindowA_Sec'] >= 1].copy()
+        # Filter calls for this customer before order time
+        matches = calls_df[(calls_df['Phone Number'].astype(str).str.contains(o_phone)) & 
+                           (calls_df['Call Time'] < o_time)]
         
-        if agent_set.empty:
-            # If no one even hit 1 second, it remains Organic
-            row = group.iloc[0].to_dict()
-            row['Attributed Revenue'] = order_val
-            row['Agent Name'] = 'Organic'
-            final_results.append(row)
+        if matches.empty:
+            final_rows.append({**order.to_dict(), 'Agent': 'Organic', 'Window A Time': '00:00:00', 'Window B Time': '00:00:00', 'Attributed Revenue': o_val})
             continue
 
-        # --- PATH A: < 1,00,000 (Duplication) ---
-        if order_val < 100000:
-            qualified = agent_set[agent_set['WindowA_Sec'] >= 60]
-            
-            if not qualified.empty:
-                for _, ag in qualified.iterrows():
-                    res = ag.to_dict()
-                    res['Attributed Revenue'] = order_val
-                    final_results.append(res)
-            else:
-                # Fallback: Highest talker in Window A gets 100%
-                top_ag = agent_set.sort_values(by='WindowA_Sec', ascending=False).iloc[0].to_dict()
-                top_ag['Attributed Revenue'] = order_val
-                final_results.append(top_ag)
+        # Aggregate by Agent
+        agent_data = []
+        for agent, group in matches.groupby('User ID'):
+            win_a_secs = group['Secs'].sum()
+            win_b_secs = group[group['Call Time'] >= feb_start]['Secs'].sum()
+            if win_a_secs >= 1: # Only consider agents with >= 1s connection
+                agent_data.append({'Agent': agent, 'WinA': win_a_secs, 'WinB': win_b_secs})
+        
+        if not agent_data:
+            final_rows.append({**order.to_dict(), 'Agent': 'Organic', 'Window A Time': '00:00:00', 'Window B Time': '00:00:00', 'Attributed Revenue': o_val})
+            continue
 
-        # --- PATH B: >= 1,00,000 (Proportionate Split) ---
+        # 3. Apply Rules
+        df_agents = pd.DataFrame(agent_data)
+        
+        if o_val < 100000:
+            qual = df_agents[df_agents['WinA'] >= 60]
+            if qual.empty:
+                top = df_agents.sort_values('WinA', ascending=False).iloc[0]
+                final_rows.append({**order.to_dict(), 'Agent': top['Agent'], 'Window A Time': sec_to_hms(top['WinA']), 'Window B Time': sec_to_hms(top['WinB']), 'Attributed Revenue': o_val})
+            else:
+                for _, ag in qual.iterrows():
+                    final_rows.append({**order.to_dict(), 'Agent': ag['Agent'], 'Window A Time': sec_to_hms(ag['WinA']), 'Window B Time': sec_to_hms(ag['WinB']), 'Attributed Revenue': o_val})
         else:
-            qualified = agent_set[agent_set['WindowA_Sec'] >= 180]
-            
-            if not qualified.empty:
-                total_q_sec = qualified['WindowA_Sec'].sum()
-                for _, ag in qualified.iterrows():
-                    res = ag.to_dict()
-                    share = ag['WindowA_Sec'] / total_q_sec
-                    res['Attributed Revenue'] = round(order_val * share, 2)
-                    final_results.append(res)
+            qual = df_agents[df_agents['WinA'] >= 180]
+            if qual.empty:
+                top = df_agents.sort_values('WinA', ascending=False).iloc[0]
+                final_rows.append({**order.to_dict(), 'Agent': top['Agent'], 'Window A Time': sec_to_hms(top['WinA']), 'Window B Time': sec_to_hms(top['WinB']), 'Attributed Revenue': o_val})
             else:
-                # Fallback: Highest talker in Window A gets 100%
-                top_ag = agent_set.sort_values(by='WindowA_Sec', ascending=False).iloc[0].to_dict()
-                top_ag['Attributed Revenue'] = order_val
-                final_results.append(top_ag)
+                total_win_a = qual['WinA'].sum()
+                for _, ag in qual.iterrows():
+                    share = ag['WinA'] / total_win_a
+                    final_rows.append({**order.to_dict(), 'Agent': ag['Agent'], 'Window A Time': sec_to_hms(ag['WinA']), 'Window B Time': sec_to_hms(ag['WinB']), 'Attributed Revenue': round(o_val * share, 2)})
 
-    return pd.DataFrame(final_results)
+    return pd.DataFrame(final_rows)
